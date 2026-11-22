@@ -342,8 +342,9 @@ def draw_item(page, faces, x, y, width, dateline, text):
 
 def draw_block(page, faces, x, width, y, regions):
     for kicker, colour, items in regions:
+        kw = measure(faces, (BOLD, 19), kicker, tracking=1)
         typeset(page, faces, (BOLD, 19), x, y, kicker, colour, tracking=1)
-        page.hline(x, y + 25, 52, colour, 3)
+        page.hline(x, y + 25, kw, colour, 3)
         y += 33
         for dateline, text in items:
             y = draw_item(page, faces, x, y, width, dateline, text)
