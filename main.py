@@ -1,112 +1,172 @@
 #!/usr/bin/env python3
-"""The World in One Page — Sunday 22 November 2026.
+"""One page of world news for Sunday 22 November 2026, drawn by hand.
 
-A one-page newspaper drawn entirely by this program: standard library
-only, no network, no clock, no randomness, so two runs write identical
-bytes. It reads a pre-rendered glyph atlas (atlas.bin) sitting next to
-it, paints the page into an RGB buffer and encodes that buffer as PNG.
+This program paints a newspaper front page into memory and writes it
+out as a PNG. Everything is decided up front: the words, the colours,
+the boxes and the type. There is no network access, no clock and no
+randomness anywhere, so running it twice gives the same bytes twice.
 
-The page: a masthead with the date, a lead story (COP31 nearing a deal)
-beside a drawn globe, then 38 more stories grouped into 7 regions over
-two columns, and a band of numbers at the foot. 39 stories in all,
-every one real and reported on 22 November 2026 (see SOURCES.md in the
-work directory for the source of each story).
+How the picture is built, in order: a paper-coloured sheet with a
+double border; a masthead with the date and a story count; a lead
+story about the COP31 talks next to a small drawn globe; thirty-eight
+further stories sorted into seven regions across two columns; a band
+of four big numbers; and a footer naming the sources.
+
+The letterforms come from atlas.bin, a file of pre-rendered glyph
+bitmaps that sits next to this program. The program only ever reads
+that file; it never writes anything except the finished entry.png.
 """
 
 import math
 import os
 import struct
-import sys
 import zlib
 
-PAGE_W = 1024
-PAGE_H = 1024
+SHEET_W = 1024
+SHEET_H = 1024
 
 PAPER = (248, 243, 231)
 INK = (24, 23, 20)
-RED = (176, 36, 28)
-BLUE = (28, 76, 138)
-TEAL = (14, 110, 105)
-FAINT = (170, 160, 142)
-WHITE = (255, 255, 255)
+CRIMSON = (176, 36, 28)
+OCEAN = (28, 76, 138)
+PINE = (14, 110, 105)
+PALE = (170, 160, 142)
+SNOW = (255, 255, 255)
 
-BOLD = 1
-REG = 0
+HEAVY = 1
+PLAIN = 0
 
 
-# ------------------------------------------------------------------ faces
-def read_font_faces(path):
-    """Read atlas.bin into {(bold, size): (ascent, descent, glyphs)}."""
+# ------------------------------------------------------------ atlas file
+class Glyph:
+    """One pre-rendered letter: its offset, size, advance and bitmap."""
+
+    __slots__ = ("dx", "dy", "w", "h", "adv", "bits")
+
+    def __init__(self, dx, dy, w, h, adv, bits):
+        self.dx = dx
+        self.dy = dy
+        self.w = w
+        self.h = h
+        self.adv = adv
+        self.bits = bits
+
+
+class Face:
+    """One weight-and-size of the typeface, with all its glyphs."""
+
+    __slots__ = ("asc", "desc", "glyphs")
+
+    def __init__(self, asc, desc):
+        self.asc = asc
+        self.desc = desc
+        self.glyphs = {}
+
+
+class Cursor:
+    """A reading head that walks a byte string, big-endian."""
+
+    def __init__(self, blob, pos=0):
+        self.blob = blob
+        self.pos = pos
+
+    def take(self, n):
+        chunk = self.blob[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def u8(self):
+        (value,) = struct.unpack_from(">B", self.blob, self.pos)
+        self.pos += 1
+        return value
+
+    def u16(self):
+        (value,) = struct.unpack_from(">H", self.blob, self.pos)
+        self.pos += 2
+        return value
+
+    def i16(self):
+        (value,) = struct.unpack_from(">h", self.blob, self.pos)
+        self.pos += 2
+        return value
+
+    def u32(self):
+        (value,) = struct.unpack_from(">I", self.blob, self.pos)
+        self.pos += 4
+        return value
+
+
+def load_atlas(path):
+    """Decode atlas.bin into {(heavy, size): Face}."""
     with open(path, "rb") as handle:
         blob = handle.read()
     if blob[:7] != b"ATLAS1\n":
         raise ValueError("atlas.bin has the wrong magic")
-    pos = 7
-    (nfaces,) = struct.unpack_from(">I", blob, pos)
-    pos += 4
+    cur = Cursor(blob, 7)
     faces = {}
-    for _ in range(nfaces):
-        is_bold, size, asc, desc = struct.unpack_from(">HBHH", blob, pos)
-        pos += 7
-        (count,) = struct.unpack_from(">H", blob, pos)
-        pos += 2
-        table = {}
-        for _ in range(count):
-            code, xoff, yoff, gw, gh, adv = struct.unpack_from(
-                ">IhhHHH", blob, pos)
-            pos += 14
-            (nbytes,) = struct.unpack_from(">I", blob, pos)
-            pos += 4
-            table[code] = (xoff, yoff, gw, gh, adv, blob[pos:pos + nbytes])
-            pos += nbytes
-        faces[(is_bold, size)] = (asc, desc, table)
+    for _ in range(cur.u32()):
+        heavy = cur.u16()
+        size = cur.u8()
+        asc = cur.u16()
+        desc = cur.u16()
+        face = Face(asc, desc)
+        for _ in range(cur.u16()):
+            code = cur.u32()
+            dx = cur.i16()
+            dy = cur.i16()
+            gw = cur.u16()
+            gh = cur.u16()
+            adv = cur.u16()
+            nbytes = cur.u32()
+            face.glyphs[code] = Glyph(dx, dy, gw, gh, adv, cur.take(nbytes))
+        faces[(heavy, size)] = face
     return faces
 
 
-# ------------------------------------------------------------------- page
-class Page:
-    """An RGB pixel buffer with rectangle, line and circle primitives."""
+# -------------------------------------------------------------- the sheet
+class Canvas:
+    """An RGB picture held in memory, with a few drawing tools."""
 
-    def __init__(self, width, height, background):
-        self.width = width
-        self.height = height
-        self.pixels = bytearray(bytes(background) * width * height)
+    def __init__(self, w, h, bg):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(bytes(bg) * w * h)
 
-    def put(self, x, y, colour):
-        if 0 <= x < self.width and 0 <= y < self.height:
-            at = (y * self.width + x) * 3
-            self.pixels[at:at + 3] = bytes(colour)
+    def dot(self, x, y, rgb):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            at = (y * self.w + x) * 3
+            self.buf[at:at + 3] = bytes(rgb)
 
-    def rect(self, x, y, w, h, colour):
+    def fill(self, x, y, w, h, rgb):
         x0 = max(0, x)
         y0 = max(0, y)
-        x1 = min(self.width, x + w)
-        y1 = min(self.height, y + h)
+        x1 = min(self.w, x + w)
+        y1 = min(self.h, y + h)
         if x1 <= x0 or y1 <= y0:
             return
-        row = bytes(colour) * (x1 - x0)
+        run = bytes(rgb) * (x1 - x0)
         for yy in range(y0, y1):
-            at = (yy * self.width + x0) * 3
-            self.pixels[at:at + len(row)] = row
+            at = (yy * self.w + x0) * 3
+            self.buf[at:at + len(run)] = run
 
-    def hline(self, x, y, w, colour, thick=1):
-        self.rect(x, y, w, thick, colour)
+    def rule(self, x, y, length, rgb, thick=1):
+        self.fill(x, y, length, thick, rgb)
 
-    def outline(self, x, y, w, h, colour, thick=1):
-        self.rect(x, y, w, thick, colour)
-        self.rect(x, y + h - thick, w, thick, colour)
-        self.rect(x, y, thick, h, colour)
-        self.rect(x + w - thick, y, thick, h, colour)
+    def frame(self, x, y, w, h, rgb, thick=1):
+        self.fill(x, y, w, thick, rgb)
+        self.fill(x, y + h - thick, w, thick, rgb)
+        self.fill(x, y, thick, h, rgb)
+        self.fill(x + w - thick, y, thick, h, rgb)
 
-    def segment(self, x0, y0, x1, y1, colour):
-        """Bresenham line."""
+    def stroke(self, x0, y0, x1, y1, rgb):
+        """A straight line, Bresenham's way."""
         dx = abs(x1 - x0)
         dy = -abs(y1 - y0)
         sx = 1 if x0 < x1 else -1
         sy = 1 if y0 < y1 else -1
         err = dx + dy
         while True:
-            self.put(x0, y0, colour)
+            self.dot(x0, y0, rgb)
             if x0 == x1 and y0 == y1:
                 break
             e2 = 2 * err
@@ -117,315 +177,330 @@ class Page:
                 err += dx
                 y0 += sy
 
-    def disc(self, cx, cy, r, colour):
+    def filled_circle(self, cx, cy, r, rgb):
         for yy in range(cy - r, cy + r + 1):
             dy = yy - cy
             half = int(math.sqrt(max(0, r * r - dy * dy)))
-            self.rect(cx - half, yy, half * 2 + 1, 1, colour)
+            self.fill(cx - half, yy, half * 2 + 1, 1, rgb)
 
-    def ring(self, cx, cy, r, colour, thick=1):
-        for t in range(thick):
-            rr = r - t
+    def circle(self, cx, cy, r, rgb, thick=1):
+        for layer in range(thick):
+            rr = r - layer
             steps = max(64, int(2 * math.pi * rr))
             for i in range(steps):
                 a = 2 * math.pi * i / steps
-                self.put(cx + int(rr * math.cos(a)),
-                         cy + int(rr * math.sin(a)), colour)
+                self.dot(cx + int(rr * math.cos(a)),
+                         cy + int(rr * math.sin(a)), rgb)
 
-    def ellipse(self, cx, cy, a, b, colour):
+    def oval(self, cx, cy, a, b, rgb):
         steps = max(64, int(2 * math.pi * max(a, b)))
         for i in range(steps):
             ang = 2 * math.pi * i / steps
-            self.put(cx + int(a * math.cos(ang)),
-                     cy + int(b * math.sin(ang)), colour)
+            self.dot(cx + int(a * math.cos(ang)),
+                     cy + int(b * math.sin(ang)), rgb)
 
-    def chord(self, cx, cy, r, dy, colour):
-        """Horizontal chord of a circle, dy below centre."""
+    def chord(self, cx, cy, r, dy, rgb):
+        """One horizontal slice of a circle, dy below its centre."""
         half = int(math.sqrt(max(0, r * r - dy * dy)))
-        self.rect(cx - half, cy + dy, half * 2 + 1, 1, colour)
+        self.fill(cx - half, cy + dy, half * 2 + 1, 1, rgb)
 
 
-# ------------------------------------------------------------------- type
-def lookup(faces, face, char):
-    _, _, table = faces[face]
-    found = table.get(ord(char))
+# -------------------------------------------------------------- setting type
+def glyph_for(face, ch):
+    found = face.glyphs.get(ord(ch))
     if found is None:
-        found = table.get(ord("?"))
+        found = face.glyphs.get(ord("?"))
     return found
 
 
-def measure(faces, face, text, tracking=0):
+def text_width(faces, key, s, tracking=0):
+    face = faces[key]
     total = 0
-    for char in text:
-        total += lookup(faces, face, char)[4] + tracking
-    return total - tracking if text else 0
+    for ch in s:
+        total += glyph_for(face, ch).adv + tracking
+    return total - tracking if s else 0
 
 
-def pitch(faces, face):
-    ascent, descent, _ = faces[face]
-    return ascent + descent
+def face_height(faces, key):
+    face = faces[key]
+    return face.asc + face.desc
 
 
-def typeset(page, faces, face, x, y_top, text, colour, tracking=0):
-    """Paint text; returns the pen x after the last glyph."""
-    ascent, _, _ = faces[face]
-    baseline = y_top + ascent
+def draw_text(canvas, faces, key, x, y, s, rgb, tracking=0):
+    """Paint a string; hands back the pen position after the last glyph."""
+    face = faces[key]
     pen = x
-    for char in text:
-        xoff, yoff, gw, gh, adv, bits = lookup(faces, face, char)
-        if gw and gh:
-            row_bytes = (gw + 7) // 8
-            for gy in range(gh):
-                yy = baseline - ascent + yoff + gy
-                if yy < 0 or yy >= page.height:
+    for ch in s:
+        g = glyph_for(face, ch)
+        if g.w and g.h:
+            stride = (g.w + 7) // 8
+            for gy in range(g.h):
+                yy = y + g.dy + gy
+                if yy < 0 or yy >= canvas.h:
                     continue
-                for bx in range(row_bytes):
-                    byte = bits[gy * row_bytes + bx]
+                for bx in range(stride):
+                    byte = g.bits[gy * stride + bx]
                     if not byte:
                         continue
                     for bit in range(8):
                         if byte & (0x80 >> bit):
-                            xx = pen + xoff + bx * 8 + bit
-                            if 0 <= xx < page.width:
-                                at = (yy * page.width + xx) * 3
-                                page.pixels[at:at + 3] = bytes(colour)
-        pen += adv + tracking
+                            xx = pen + g.dx + bx * 8 + bit
+                            if 0 <= xx < canvas.w:
+                                at = (yy * canvas.w + xx) * 3
+                                canvas.buf[at:at + 3] = bytes(rgb)
+        pen += g.adv + tracking
     return pen
 
 
-def typeset_centred(page, faces, face, cx, y_top, text, colour, tracking=0):
-    width = measure(faces, face, text, tracking)
-    typeset(page, faces, face, cx - width // 2, y_top, text, colour, tracking)
+def draw_text_centred(canvas, faces, key, cx, y, s, rgb, tracking=0):
+    w = text_width(faces, key, s, tracking)
+    draw_text(canvas, faces, key, cx - w // 2, y, s, rgb, tracking)
 
 
-def wrap(faces, face, text, max_width, tracking=0):
+def wrap_text(faces, key, s, max_w, tracking=0):
+    """Greedy word wrap: pack as many words per line as fit."""
     lines = []
-    for chunk in text.split("\n"):
+    for chunk in s.split("\n"):
         words = chunk.split(" ")
-        current = ""
-        for word in words:
-            trial = word if not current else current + " " + word
-            if not current or measure(faces, face, trial, tracking) <= max_width:
-                current = trial
+        i = 0
+        cur = ""
+        while i < len(words):
+            word = words[i]
+            cand = word if cur == "" else cur + " " + word
+            if cur == "" or text_width(faces, key, cand, tracking) <= max_w:
+                cur = cand
+                i += 1
             else:
-                lines.append(current)
-                current = word
-        lines.append(current)
+                lines.append(cur)
+                cur = ""
+        lines.append(cur)
     return lines
 
 
-def typeset_para(page, faces, face, x, y_top, text, max_width,
-                 colour, gap=3, tracking=0):
-    step = pitch(faces, face) + gap
-    y = y_top
-    for line in wrap(faces, face, text, max_width, tracking):
-        typeset(page, faces, face, x, y, line, colour, tracking)
-        y += step
-    return y
+def draw_paragraph(canvas, faces, key, x, y, s, max_w, rgb, gap=3,
+                   tracking=0):
+    step = face_height(faces, key) + gap
+    cy = y
+    for line in wrap_text(faces, key, s, max_w, tracking):
+        draw_text(canvas, faces, key, x, cy, line, rgb, tracking)
+        cy += step
+    return cy
 
 
-# -------------------------------------------------------------------- png
-def encode_png(page):
+# ------------------------------------------------------------------ the png
+def png_bytes(canvas):
     raw = bytearray()
-    stride = page.width * 3
-    for yy in range(page.height):
+    stride = canvas.w * 3
+    for yy in range(canvas.h):
         raw.append(0)
-        raw += page.pixels[yy * stride:(yy + 1) * stride]
-    payload = zlib.compress(bytes(raw), 9)
+        raw += canvas.buf[yy * stride:(yy + 1) * stride]
+    body = zlib.compress(bytes(raw), 9)
+    out = [b"\x89PNG\r\n\x1a\n"]
+    chunks = (
+        (b"IHDR", struct.pack(">IIBBBBB", canvas.w, canvas.h, 8, 2, 0, 0, 0)),
+        (b"IDAT", body),
+        (b"IEND", b""),
+    )
+    for kind, data in chunks:
+        out.append(struct.pack(">I", len(data)))
+        out.append(kind)
+        out.append(data)
+        out.append(struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return b"".join(out)
 
-    def chunk(kind, data):
-        out = struct.pack(">I", len(data)) + kind + data
-        return out + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
 
-    header = struct.pack(">IIBBBBB", page.width, page.height, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
-            + chunk(b"IDAT", payload) + chunk(b"IEND", b""))
-
-
-# ---------------------------------------------------------------- content
+# -------------------------------------------------------------- the content
 MASTHEAD = "THE WORLD IN ONE PAGE"
 DATE_LINE = "SUNDAY, 22 NOVEMBER 2026"
 TAG_LINE = "39 STORIES  \u00b7  7 REGIONS  \u00b7  ONE DAY"
 
-LEAD_KICKER = "ANTALYA \u2014 COP31 NEARS A DEAL"
-LEAD_LINES = ["COP31 nears a final deal", "as new package lands"]
-LEAD_TEXT = (
-    "Presidents table a text they say all can accept; objections by "
-    "0300 GMT, a vote at 0600 GMT."
-)
+LEAD = {
+    "kicker": "ANTALYA \u2014 COP31 NEARS A DEAL",
+    "headline": ["COP31 nears a final deal", "as new package lands"],
+    "body": ("Presidents table a text they say all can accept; "
+             "objections by 0300 GMT, a vote at 0600 GMT."),
+}
 
-# (region kicker, colour, [(dateline, one-line story), ...])
-REGIONS_LEFT = [
-    ("MIDDLE EAST", RED, [
-        ("BAHRAIN", "Iran hits 4 US bases; 2 Patriot radars claimed."),
-        ("HORMUZ", "3 tankers attacked; 2 hit, 1 mined, no deaths."),
-        ("WASHINGTON", "Trump seeks permanent Iran deal."),
-        ("KHARG", "14 Iranian tankers mass to break US blockade."),
-        ("JERUSALEM", "Eisenkot invites Likud to coalition talks."),
-    ]),
-    ("EUROPE", BLUE, [
-        ("HELSINKI", "Finland: war \u2018spilling over\u2019 to Baltic."),
-        ("TALLINN", "Estonia to shut its border with Russia."),
-        ("BRUSSELS", "EU-Indonesia sign trade pact; tariffs gone."),
-        ("BERLIN", "Coalition rallies to push Moscow to talks."),
-        ("WARSAW", "Poland fires up Patriots after airspace breach."),
-        ("PARIS", "France probes Depardieu over gang-rape claim."),
-    ]),
-    ("UKRAINE WAR", TEAL, [
-        ("LVIV", "Russian strike kills 2, wounds 10 in the west."),
-        ("LONDON", "UK, Ukraine to build strike drones together."),
-        ("KYIV", "Zelensky: Russia hit bridges 109 times before."),
-        ("SOFIA", "Bulgaria backs India Black Sea ceasefire plan."),
-    ]),
-    ("AMERICAS", RED, [
-        ("SINALOA", "11 killed as cartel violence erupts."),
-        ("BRASILIA", "Bolsonaro in ICU with bowel obstruction."),
-        ("WASHINGTON", "FBI probes hack of its crime database."),
-        ("PENTAGON", "Memo limits socials with Canadian military."),
-    ]),
+# Two columns of region sections; each section has a coloured heading
+# and a list of one-line stories with a bold dateline up front.
+COLUMNS = [
+    [
+        {"head": "MIDDLE EAST", "tint": CRIMSON, "items": [
+            {"place": "BAHRAIN", "line": "Iran hits 4 US bases; 2 Patriot radars claimed."},
+            {"place": "HORMUZ", "line": "3 tankers attacked; 2 hit, 1 mined, no deaths."},
+            {"place": "WASHINGTON", "line": "Trump seeks permanent Iran deal."},
+            {"place": "KHARG", "line": "14 Iranian tankers mass to break US blockade."},
+            {"place": "JERUSALEM", "line": "Eisenkot invites Likud to coalition talks."},
+        ]},
+        {"head": "EUROPE", "tint": OCEAN, "items": [
+            {"place": "HELSINKI", "line": "Finland: war \u2018spilling over\u2019 to Baltic."},
+            {"place": "TALLINN", "line": "Estonia to shut its border with Russia."},
+            {"place": "BRUSSELS", "line": "EU-Indonesia sign trade pact; tariffs gone."},
+            {"place": "BERLIN", "line": "Coalition rallies to push Moscow to talks."},
+            {"place": "WARSAW", "line": "Poland fires up Patriots after airspace breach."},
+            {"place": "PARIS", "line": "France probes Depardieu over gang-rape claim."},
+        ]},
+        {"head": "UKRAINE WAR", "tint": PINE, "items": [
+            {"place": "LVIV", "line": "Russian strike kills 2, wounds 10 in the west."},
+            {"place": "LONDON", "line": "UK, Ukraine to build strike drones together."},
+            {"place": "KYIV", "line": "Zelensky: Russia hit bridges 109 times before."},
+            {"place": "SOFIA", "line": "Bulgaria backs India Black Sea ceasefire plan."},
+        ]},
+        {"head": "AMERICAS", "tint": CRIMSON, "items": [
+            {"place": "SINALOA", "line": "11 killed as cartel violence erupts."},
+            {"place": "BRASILIA", "line": "Bolsonaro in ICU with bowel obstruction."},
+            {"place": "WASHINGTON", "line": "FBI probes hack of its crime database."},
+            {"place": "PENTAGON", "line": "Memo limits socials with Canadian military."},
+        ]},
+    ],
+    [
+        {"head": "ASIA-PACIFIC", "tint": OCEAN, "items": [
+            {"place": "PATNA", "line": "Modi opens Nitish Setu bridge in Bihar."},
+            {"place": "RANCHI", "line": "Cyclone Akvan cancels 14 flights."},
+            {"place": "TOKYO", "line": "Japan to train live-fire in India, a first."},
+            {"place": "HONG KONG", "line": "Election Committee voting opens."},
+            {"place": "WELLINGTON", "line": "India 629-6, a record total in New Zealand."},
+            {"place": "ISLAMABAD", "line": "Suicide bombing kills 5, wounds 13."},
+        ]},
+        {"head": "MARKETS & TECH", "tint": PINE, "items": [
+            {"place": "SHANGHAI", "line": "Leapmotor Q3 profit plunges 73%."},
+            {"place": "BEIJING", "line": "Foreign cash into China tech up 31%."},
+            {"place": "SHENZHEN", "line": "BYD, Huawei unveil new SUVs."},
+            {"place": "LAS VEGAS", "line": "Verstappen on pole; Antonelli penalised."},
+            {"place": "WASHINGTON", "line": "Signal blocks screenshots over AI spying."},
+            {"place": "LONDON", "line": "Crude oil futures fall more than 3%."},
+        ]},
+        {"head": "SCIENCE & WORLD", "tint": CRIMSON, "items": [
+            {"place": "TIMOR SEA", "line": "M6.8 quake strikes off Timor-Leste."},
+            {"place": "GENEVA", "line": "UN fails to agree rules on \u2018killer robots\u2019."},
+            {"place": "JOHANNESBURG", "line": "Mlambo-Ngcuka dies at 71."},
+            {"place": "CAPE TOWN", "line": "Murders fall, yet 60 a day are killed."},
+            {"place": "DAKAR", "line": "Senegal president imposes budget by decree."},
+            {"place": "CAIRO", "line": "Egypt nears $2.3bn IMF payout."},
+            {"place": "EUROPA", "line": "Sodium cloud traced around Jupiter\u2019s moon."},
+        ]},
+    ],
 ]
 
-REGIONS_RIGHT = [
-    ("ASIA-PACIFIC", BLUE, [
-        ("PATNA", "Modi opens Nitish Setu bridge in Bihar."),
-        ("RANCHI", "Cyclone Akvan cancels 14 flights."),
-        ("TOKYO", "Japan to train live-fire in India, a first."),
-        ("HONG KONG", "Election Committee voting opens."),
-        ("WELLINGTON", "India 629-6, a record total in New Zealand."),
-        ("ISLAMABAD", "Suicide bombing kills 5, wounds 13."),
-    ]),
-    ("MARKETS & TECH", TEAL, [
-        ("SHANGHAI", "Leapmotor Q3 profit plunges 73%."),
-        ("BEIJING", "Foreign cash into China tech up 31%."),
-        ("SHENZHEN", "BYD, Huawei unveil new SUVs."),
-        ("LAS VEGAS", "Verstappen on pole; Antonelli penalised."),
-        ("WASHINGTON", "Signal blocks screenshots over AI spying."),
-        ("LONDON", "Crude oil futures fall more than 3%."),
-    ]),
-    ("SCIENCE & WORLD", RED, [
-        ("TIMOR SEA", "M6.8 quake strikes off Timor-Leste."),
-        ("GENEVA", "UN fails to agree rules on \u2018killer robots\u2019."),
-        ("JOHANNESBURG", "Mlambo-Ngcuka dies at 71."),
-        ("CAPE TOWN", "Murders fall, yet 60 a day are killed."),
-        ("DAKAR", "Senegal president imposes budget by decree."),
-        ("CAIRO", "Egypt nears $2.3bn IMF payout."),
-        ("EUROPA", "Sodium cloud traced around Jupiter\u2019s moon."),
-    ]),
+FIGURES = [
+    {"big": "98.5%", "note": "tariffs scrapped\nin EU-Indonesia deal"},
+    {"big": "629-6", "note": "India\u2019s record\ntotal in New Zealand"},
+    {"big": "M6.8", "note": "quake off\nTimor-Leste"},
+    {"big": "11", "note": "killed in Sinaloa\ncartel violence"},
 ]
 
-STATS = [
-    ("98.5%", "tariffs scrapped\nin EU-Indonesia deal"),
-    ("629-6", "India\u2019s record\ntotal in New Zealand"),
-    ("M6.8", "quake off\nTimor-Leste"),
-    ("11", "killed in Sinaloa\ncartel violence"),
-]
-
-FOOT_A = ("Sources: Reuters \u00b7 AP \u00b7 AFP \u00b7 BBC \u00b7 CNN \u00b7 USGS \u00b7 NYT \u00b7 DW"
-          "  \u2014  Events of Sunday 22 November 2026")
-FOOT_B = ("39 stories \u00b7 7 regions \u2014 Drawn by a program. No network, "
-          "no AI images; every word set in type.")
+CREDIT_A = ("Sources: Reuters \u00b7 AP \u00b7 AFP \u00b7 BBC \u00b7 CNN \u00b7 USGS \u00b7 NYT \u00b7 DW"
+            "  \u2014  Events of Sunday 22 November 2026")
+CREDIT_B = ("39 stories \u00b7 7 regions \u2014 Drawn by a program. No network, "
+            "no AI images; every word set in type.")
 
 
-# ------------------------------------------------------------------ layout
-def draw_item(page, faces, x, y, width, dateline, text):
-    """One story on a single line: bold dateline, regular rest."""
-    head = dateline + " \u2014 "
-    after = typeset(page, faces, (BOLD, 15), x, y, head, INK)
-    typeset(page, faces, (REG, 15), after, y, text, INK)
-    total = measure(faces, (BOLD, 15), head) + \
-        measure(faces, (REG, 15), text)
-    if total > width:
-        raise ValueError("item too wide for column: %s %s (%d > %d)"
-                         % (dateline, text, total, width))
+# -------------------------------------------------------------- the layout
+def paint_story(canvas, faces, x, y, col_w, place, line):
+    """One story on a single line: bold dateline, plain rest."""
+    head = place + " \u2014 "
+    after = draw_text(canvas, faces, (HEAVY, 15), x, y, head, INK)
+    draw_text(canvas, faces, (PLAIN, 15), after, y, line, INK)
+    total = (text_width(faces, (HEAVY, 15), head)
+             + text_width(faces, (PLAIN, 15), line))
+    if total > col_w:
+        raise ValueError("story too wide: %s %s (%d > %d)"
+                         % (place, line, total, col_w))
     return y + 18
 
 
-def draw_block(page, faces, x, width, y, regions):
-    for kicker, colour, items in regions:
-        kw = measure(faces, (BOLD, 19), kicker, tracking=1)
-        typeset(page, faces, (BOLD, 19), x, y, kicker, colour, tracking=1)
-        page.hline(x, y + 25, kw, colour, 3)
+def paint_section(canvas, faces, x, col_w, y, sections):
+    for sec in sections:
+        head_w = text_width(faces, (HEAVY, 19), sec["head"], tracking=1)
+        draw_text(canvas, faces, (HEAVY, 19), x, y, sec["head"],
+                  sec["tint"], tracking=1)
+        canvas.rule(x, y + 25, head_w, sec["tint"], 3)
         y += 33
-        for dateline, text in items:
-            y = draw_item(page, faces, x, y, width, dateline, text)
+        for item in sec["items"]:
+            y = paint_story(canvas, faces, x, y, col_w,
+                            item["place"], item["line"])
         y += 6
     return y
 
 
-def draw_world(page, cx, cy, r):
-    page.disc(cx, cy, r, BLUE)
-    page.ring(cx, cy, r, INK, 2)
-    page.ring(cx, cy, r + 7, INK, 1)
-    page.ellipse(cx, cy, 24, r - 4, WHITE)
-    page.ellipse(cx, cy, r - 4, 24, WHITE)
-    page.chord(cx, cy, r - 2, -28, WHITE)
-    page.chord(cx, cy, r - 2, 28, WHITE)
-    page.disc(cx + 40, cy - 42, 5, RED)
+def paint_globe(canvas, cx, cy, r):
+    canvas.filled_circle(cx, cy, r, OCEAN)
+    canvas.circle(cx, cy, r, INK, 2)
+    canvas.circle(cx, cy, r + 7, INK, 1)
+    canvas.oval(cx, cy, 24, r - 4, SNOW)
+    canvas.oval(cx, cy, r - 4, 24, SNOW)
+    canvas.chord(cx, cy, r - 2, -28, SNOW)
+    canvas.chord(cx, cy, r - 2, 28, SNOW)
+    canvas.filled_circle(cx + 40, cy - 42, 5, CRIMSON)
 
 
-def render(faces):
-    page = Page(PAGE_W, PAGE_H, PAPER)
-    page.outline(14, 14, PAGE_W - 28, PAGE_H - 28, INK, 2)
-    page.outline(20, 20, PAGE_W - 40, PAGE_H - 40, INK, 1)
+def build_page(faces):
+    sheet = Canvas(SHEET_W, SHEET_H, PAPER)
+    sheet.frame(14, 14, SHEET_W - 28, SHEET_H - 28, INK, 2)
+    sheet.frame(20, 20, SHEET_W - 40, SHEET_H - 40, INK, 1)
 
-    typeset_centred(page, faces, (BOLD, 64), PAGE_W // 2, 32, MASTHEAD, INK)
-    typeset_centred(page, faces, (BOLD, 22), PAGE_W // 2, 112, DATE_LINE, RED)
-    typeset_centred(page, faces, (REG, 18), PAGE_W // 2, 142, TAG_LINE,
-                    INK, tracking=4)
-    page.hline(36, 172, PAGE_W - 72, INK, 5)
-    page.hline(36, 181, PAGE_W - 72, INK, 1)
+    draw_text_centred(sheet, faces, (HEAVY, 64), SHEET_W // 2, 32,
+                      MASTHEAD, INK)
+    draw_text_centred(sheet, faces, (HEAVY, 22), SHEET_W // 2, 112,
+                      DATE_LINE, CRIMSON)
+    draw_text_centred(sheet, faces, (PLAIN, 18), SHEET_W // 2, 142,
+                      TAG_LINE, INK, tracking=4)
+    sheet.rule(36, 172, SHEET_W - 72, INK, 5)
+    sheet.rule(36, 181, SHEET_W - 72, INK, 1)
 
-    # Lead story, left; drawn globe, right.
-    typeset(page, faces, (BOLD, 19), 36, 192, LEAD_KICKER, RED, tracking=1)
+    # Lead story on the left, the drawn globe on the right.
+    draw_text(sheet, faces, (HEAVY, 19), 36, 192, LEAD["kicker"],
+              CRIMSON, tracking=1)
     y = 216
-    for line in LEAD_LINES:
-        typeset(page, faces, (BOLD, 30), 36, y, line, INK)
-        y += pitch(faces, (BOLD, 30)) + 2
+    for headline in LEAD["headline"]:
+        draw_text(sheet, faces, (HEAVY, 30), 36, y, headline, INK)
+        y += face_height(faces, (HEAVY, 30)) + 2
     y += 6
-    y = typeset_para(page, faces, (REG, 20), 36, y, LEAD_TEXT, 664,
-                     INK, gap=3)
-    draw_world(page, 852, 272, 64)
-    page.hline(36, 356, PAGE_W - 72, INK, 1)
+    y = draw_paragraph(sheet, faces, (PLAIN, 20), 36, y, LEAD["body"],
+                       664, INK, gap=3)
+    paint_globe(sheet, 852, 272, 64)
+    sheet.rule(36, 356, SHEET_W - 72, INK, 1)
 
-    # Region grid, two columns.
-    left_end = draw_block(page, faces, 36, 469, 366, REGIONS_LEFT)
-    right_end = draw_block(page, faces, 519, 469, 366, REGIONS_RIGHT)
-    grid_end = max(left_end, right_end)
-    page.rect(512, 368, 1, grid_end - 374, FAINT)
+    # Region grid, two columns with a faint divider between them.
+    left_end = paint_section(sheet, faces, 36, 469, 366, COLUMNS[0])
+    right_end = paint_section(sheet, faces, 519, 469, 366, COLUMNS[1])
+    grid_end = left_end if left_end > right_end else right_end
+    sheet.fill(512, 368, 1, grid_end - 374, PALE)
 
     # Numbers band.
     band_y = grid_end + 10
     band_h = 72
-    page.outline(36, band_y, PAGE_W - 72, band_h, INK, 1)
-    cell_w = (PAGE_W - 72) // 4
-    for i, (big, small) in enumerate(STATS):
-        cx = 36 + cell_w * i
-        if i:
-            page.rect(cx, band_y + 8, 1, band_h - 16, FAINT)
-        typeset_centred(page, faces, (BOLD, 30), cx + cell_w // 2,
-                        band_y + 4, big, RED)
-        for j, line in enumerate(small.split("\n")):
-            typeset_centred(page, faces, (REG, 15), cx + cell_w // 2,
-                            band_y + 38 + j * 17, line, INK)
+    sheet.frame(36, band_y, SHEET_W - 72, band_h, INK, 1)
+    cell = (SHEET_W - 72) // 4
+    for idx, fig in enumerate(FIGURES):
+        cx = 36 + cell * idx
+        if idx:
+            sheet.fill(cx, band_y + 8, 1, band_h - 16, PALE)
+        draw_text_centred(sheet, faces, (HEAVY, 30), cx + cell // 2,
+                          band_y + 4, fig["big"], CRIMSON)
+        for j, sub in enumerate(fig["note"].split("\n")):
+            draw_text_centred(sheet, faces, (PLAIN, 15), cx + cell // 2,
+                              band_y + 38 + j * 17, sub, INK)
 
-    page.hline(36, 956, PAGE_W - 72, INK, 1)
-    typeset_centred(page, faces, (REG, 14), PAGE_W // 2, 964, FOOT_A, INK)
-    typeset_centred(page, faces, (REG, 14), PAGE_W // 2, 982, FOOT_B, INK)
-    return page
+    sheet.rule(36, 956, SHEET_W - 72, INK, 1)
+    draw_text_centred(sheet, faces, (PLAIN, 14), SHEET_W // 2, 964,
+                      CREDIT_A, INK)
+    draw_text_centred(sheet, faces, (PLAIN, 14), SHEET_W // 2, 982,
+                      CREDIT_B, INK)
+    return sheet
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    faces = read_font_faces(os.path.join(here, "atlas.bin"))
-    data = encode_png(render(faces))
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR")
-    if not outdir:
-        outdir = "/output" if os.path.isdir("/output") else "out"
-    os.makedirs(outdir, exist_ok=True)
-    path = os.path.join(outdir, "entry.png")
-    with open(path, "wb") as handle:
+    base = os.path.dirname(os.path.abspath(__file__))
+    faces = load_atlas(os.path.join(base, "atlas.bin"))
+    data = png_bytes(build_page(faces))
+    dest = (os.environ.get("MAKEFUN_OUTPUT_DIR")
+            or ("/output" if os.path.isdir("/output") else "out"))
+    os.makedirs(dest, exist_ok=True)
+    target = os.path.join(dest, "entry.png")
+    with open(target, "wb") as handle:
         handle.write(data)
-    sys.stdout.write("wrote %s (%d bytes)\n" % (path, len(data)))
+    print("wrote %s (%d bytes)" % (target, len(data)))
 
 
 if __name__ == "__main__":
